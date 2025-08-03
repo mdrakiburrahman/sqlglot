@@ -20,10 +20,22 @@ BEGIN
     
     #DECLARE potato string = @"Crispy";
     #DECLARE tomato string = @"Crunchy";
+    #DECLARE startDateOffset int = 0;
+    #DECLARE endDateOffset int = 0;
+
+    #DECLARE potatoViewFullPath string = string.Format("{0}local/Potato/Sandbox/Views/Public/{1}.view", @potato, @start);
     
     searchlog = EXTRACT IId:int, UId:int, TimeStamp:DateTime, Market:string, Query:string, DwellTime:int, Results:string, ClickedUrls:string
         FROM @"my/ScopeTutorial/SampleInputs/SearchLog.txt"
         USING DefaultTextExtractor();
+
+    potato_snapshot = VIEW @potatoViewFullPath
+    PARAMS
+    (
+        startDate = DateTime.Parse(@start).AddDays(@startDateOffset).ToString("yyyy-MM-dd"),
+        endDate = DateTime.Parse(@end).AddDays(@endDateOffset).ToString("yyyy-MM-dd"),
+        tomato = @tomato
+    );
     
     filtered_searchlog =
         SELECT *

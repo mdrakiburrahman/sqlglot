@@ -119,6 +119,14 @@ class USqlIfDirective(exp.Expression):
     }
 
 
+class USqlViewInvocation(exp.Expression):
+    """U-SQL view invocation: variable = VIEW @path PARAMS (...);"""
+    arg_types = {
+        "this": True,  # view path (identifier/parameter)
+        "params": False,  # parameters passed to view
+    }
+
+
 def _cap_data_type_precision(expression: exp.DataType, max_precision: int = 6) -> exp.DataType:
     """
     Cap the precision of to a maximum of `max_precision` digits.
@@ -194,6 +202,20 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
         nested_expr = expression.expression
         if isinstance(nested_expr, (USqlExtract, USqlOutput, USqlCreateView)):
             nested_expr = _convert_usql_create_view_to_standard(nested_expr)
+        elif isinstance(nested_expr, USqlViewInvocation):
+            # For view invocations, use the assignment variable name as the table name
+            var_name = expression.this
+            if hasattr(var_name, 'this'):
+                table_name = var_name.this
+            elif hasattr(var_name, 'name'):
+                table_name = var_name.name
+            else:
+                table_name = str(var_name)
+            
+            nested_expr = exp.Select(
+                expressions=[exp.Star()],
+                **{"from": exp.From(this=exp.Table(this=table_name))}
+            )
         return nested_expr
     
     elif isinstance(expression, USqlExtract):
@@ -216,6 +238,24 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
         return exp.Insert(
             this=destination,
             expression=source if isinstance(source, exp.Select) else exp.Select(expressions=[source])
+        )
+    
+    elif isinstance(expression, USqlViewInvocation):
+        # Convert view invocation to a placeholder SELECT for now
+        # In a real implementation, this would need to resolve the view definition
+        # and substitute parameters, but for now we'll create a dummy SELECT
+        # Use the view path as the table name if available
+        view_path = expression.this
+        if hasattr(view_path, 'this'):
+            table_name = view_path.this
+        elif hasattr(view_path, 'name'):
+            table_name = view_path.name
+        else:
+            table_name = str(view_path) if view_path else "view_placeholder"
+        
+        return exp.Select(
+            expressions=[exp.Star()],
+            **{"from": exp.From(this=exp.Table(this=table_name))}
         )
     
     elif isinstance(expression, (USqlDeclareConst, USqlHashDeclare)):
@@ -764,7 +804,7 @@ class USQL(TSQL):
             return USqlDeclareConst(this=var, kind=kind, default=default)
 
         def _parse_usql_variable_assignment(self) -> exp.Expression:
-            """Parse: variable = SELECT/EXTRACT/expression; (without @ prefix)"""
+            """Parse: variable = SELECT/EXTRACT/VIEW/expression; (without @ prefix)"""
             var = self._parse_id_var()
             if not var:
                 self.raise_error("Expected variable name")
@@ -776,6 +816,10 @@ class USQL(TSQL):
             if self._curr and self._curr.text and self._curr.text.upper() == "EXTRACT":
                 extract_expr = self._parse_usql_extract_expression()
                 return USqlAssignment(this=var, expression=extract_expr)
+            # Check if this is a VIEW invocation
+            elif self._curr and self._curr.text and self._curr.text.upper() == "VIEW":
+                view_invocation = self._parse_usql_view_invocation()
+                return USqlAssignment(this=var, expression=view_invocation)
             else:
                 # Simple literal or expression parsing
                 if self._curr.token_type == TokenType.NUMBER:
@@ -921,6 +965,68 @@ class USQL(TSQL):
                 using=using_expr
             )
 
+        def _parse_usql_view_invocation(self) -> exp.Expression:
+            """Parse: VIEW @path PARAMS (...);"""
+            if not self._curr or self._curr.text.upper() != "VIEW":
+                self.raise_error("Expected VIEW")
+            
+            self._advance()  # consume VIEW
+            
+            # Parse the view path (usually a parameter like @potatoViewFullPath)
+            view_path = None
+            if self._curr and self._curr.token_type == TokenType.PARAMETER:
+                # Handle @parameter
+                view_path = self._parse_id_var()
+            else:
+                # Handle regular identifier or string
+                view_path = self._parse_id_var() or self._parse_string()
+            
+            if not view_path:
+                self.raise_error("Expected view path after VIEW")
+            
+            # Check for PARAMS clause
+            params = None
+            if self._curr and self._curr.text and self._curr.text.upper() == "PARAMS":
+                self._advance()  # consume PARAMS
+                
+                if not self._match(TokenType.L_PAREN):
+                    self.raise_error("Expected ( after PARAMS")
+                
+                # Parse parameter assignments
+                param_assignments = []
+                while True:
+                    if self._match(TokenType.R_PAREN):
+                        break
+                    
+                    # Parse param_name = value
+                    param_name = self._parse_id_var()
+                    if not param_name:
+                        self.raise_error("Expected parameter name")
+                    
+                    if not self._match(TokenType.EQ):
+                        self.raise_error("Expected = after parameter name")
+                    
+                    param_value = self._parse_bitwise()
+                    if not param_value:
+                        self.raise_error("Expected parameter value")
+                    
+                    # Create an assignment expression for this parameter
+                    param_assignments.append(exp.EQ(this=param_name, expression=param_value))
+                    
+                    if not self._match(TokenType.COMMA):
+                        # No comma, expect closing paren next
+                        if not self._match(TokenType.R_PAREN):
+                            self.raise_error("Expected , or ) in parameter list")
+                        break
+                
+                # Store parameters as expressions list
+                params = param_assignments
+            
+            return USqlViewInvocation(
+                this=view_path,
+                params=params
+            )
+
         def _parse_create(self) -> exp.Create | exp.Command:
             create = super()._parse_create()
 
@@ -978,6 +1084,7 @@ class USQL(TSQL):
             USqlCreateView: lambda self, e: self._usql_create_view_sql(e),
             USqlHashDeclare: lambda self, e: self._usql_hash_declare_sql(e),
             USqlIfDirective: lambda self, e: self._usql_if_directive_sql(e),
+            USqlViewInvocation: lambda self, e: self._usql_view_invocation_sql(e),
         }
 
         def _usql_extract_sql(self, expression: USqlExtract) -> str:
@@ -1074,6 +1181,21 @@ class USQL(TSQL):
                     parts.append(f"\n{self.sql(stmt)}")
             
             parts.append("\n#ENDIF")
+            return "".join(parts)
+
+        def _usql_view_invocation_sql(self, expression: USqlViewInvocation) -> str:
+            """Generate: VIEW @path PARAMS (param1 = value1, param2 = value2)"""
+            view_path_sql = self.sql(expression.this)
+            parts = [f"VIEW {view_path_sql}"]
+            
+            params = expression.args.get("params")
+            if params:
+                param_strs = []
+                for param in params:
+                    param_str = self.sql(param)
+                    param_strs.append(param_str)
+                parts.append(f" PARAMS ({', '.join(param_strs)})")
+            
             return "".join(parts)
 
         def datatype_sql(self, expression: exp.DataType) -> str:
