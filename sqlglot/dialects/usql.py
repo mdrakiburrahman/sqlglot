@@ -1,10 +1,94 @@
 from __future__ import annotations
 
+import typing as t
 
-from sqlglot import exp, transforms
+from sqlglot import exp, parser, transforms
 from sqlglot.dialects.dialect import NormalizationStrategy
 from sqlglot.dialects.tsql import TSQL
 from sqlglot.tokens import TokenType
+def _convert_usql_to_standard_sql(expression: exp.Expression) -> exp.Expression:
+    """Transform U-SQL specific constructs to standard SQL equivalents"""
+    if isinstance(expression, USqlDeclareConst):
+        # Skip constant declarations - they can be inlined later
+        return exp.Placeholder()
+    
+    elif isinstance(expression, USqlAssignment):
+        # Convert @var = EXTRACT/SELECT to a CTE or view
+        if isinstance(expression.expression, USqlExtract):
+            # Convert EXTRACT to SELECT from file
+            extract = expression.expression
+            columns = [exp.alias_(col.this, col.this) for col in extract.expressions]
+            from_clause = extract.args.get("from")
+            
+            # Create a SELECT statement that reads from the file
+            select = exp.Select(
+                expressions=columns,
+                **{"from": exp.From(this=from_clause)}
+            )
+            return select
+        else:
+            # Regular assignment - just return the expression
+            return expression.expression
+    
+    elif isinstance(expression, USqlExtract):
+        # Convert standalone EXTRACT to SELECT
+        columns = [exp.alias_(col.this, col.this) for col in expression.expressions]  
+        from_clause = expression.args.get("from")
+        
+        return exp.Select(
+            expressions=columns,
+            **{"from": exp.From(this=from_clause)}
+        )
+    
+    elif isinstance(expression, USqlOutput):
+        # Convert OUTPUT to INSERT or CREATE TABLE AS SELECT
+        source = expression.this
+        destination = expression.args.get("to")
+        
+        # For now, convert to INSERT statement  
+        return exp.Insert(
+            this=destination,
+            expression=source if isinstance(source, exp.Select) else exp.Select(expressions=[source])
+        )
+    
+    return expression
+
+
+# U-SQL specific expressions
+class USqlExtract(exp.Expression):
+    """U-SQL EXTRACT statement: @variable = EXTRACT columns FROM source USING extractor;"""
+    arg_types = {
+        "this": True,  # variable being assigned to 
+        "expressions": True,  # column definitions
+        "from": True,  # source file/table
+        "using": True,  # extractor function
+    }
+
+
+class USqlOutput(exp.Expression):
+    """U-SQL OUTPUT statement: OUTPUT @variable TO destination USING outputter;"""
+    arg_types = {
+        "this": True,  # variable/query to output
+        "to": True,  # destination file/table
+        "using": True,  # outputter function
+    }
+
+
+class USqlAssignment(exp.Expression):
+    """U-SQL variable assignment: @variable = SELECT/query;"""
+    arg_types = {
+        "this": True,  # variable being assigned to
+        "expression": True,  # the SELECT query or other expression
+    }
+
+
+class USqlDeclareConst(exp.Expression):
+    """U-SQL constant declaration: DECLARE CONST @variable type = value;"""
+    arg_types = {
+        "this": True,  # variable name
+        "kind": True,  # data type
+        "default": False,  # default value
+    }
 
 
 def _cap_data_type_precision(expression: exp.DataType, max_precision: int = 6) -> exp.DataType:
@@ -68,16 +152,233 @@ class USQL(TSQL):
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
 
     class Tokenizer(TSQL.Tokenizer):
+        # U-SQL supports // single-line comments in addition to -- and /* */
+        COMMENTS = ["--", "//", ("/*", "*/")]
+        
         # Override T-SQL tokenizer to handle TIMESTAMP differently
-        # In T-SQL, TIMESTAMP is a synonym for ROWVERSION, but in Fabric we want it to be a datetime type
+        # In T-SQL, TIMESTAMP is a synonym for ROWVERSION, but in U-SQL we want it to be a datetime type
         # Also add UTINYINT keyword mapping since T-SQL doesn't have it
         KEYWORDS = {
             **TSQL.Tokenizer.KEYWORDS,
+            "CONST": TokenType.CONSTRAINT,  # Reuse existing token 
+            "EXTRACT": TokenType.VAR,  # Treat as identifier, not command
+            "OUTPUT": TokenType.VAR,   # Treat as identifier, not command  
             "TIMESTAMP": TokenType.TIMESTAMP,
+            "USING": TokenType.USING,
             "UTINYINT": TokenType.UTINYINT,
         }
 
+        # Add == as equality operator (in addition to =)
+        def _scan_num(self) -> bool:
+            # Check for == operator first before numbers
+            if self._match("=="):
+                self._advance(2)
+                self._add_token(TokenType.EQ)
+                return True
+            return super()._scan_num()
+
+        def _scan_operator(self) -> bool:
+            # Override to handle == operator
+            if self._match("=="):
+                self._advance(2)
+                self._add_token(TokenType.EQ)
+                return True
+            return super()._scan_operator()
+
     class Parser(TSQL.Parser):
+        # U-SQL specific parsing functions
+        def _parse_statement(self) -> t.Optional[exp.Expression]:
+            # Check for U-SQL specific statements first
+            if self._match(TokenType.DECLARE):
+                if self._match(TokenType.CONSTRAINT):  # CONST reuses CONSTRAINT token
+                    return self._parse_usql_declare_const()
+                else:
+                    # Fall back to standard DECLARE
+                    self._retreat(self._index - 1)
+                    return super()._parse_statement()
+            
+            # Check for variable assignment (@var = ...)
+            if self._curr and self._curr.token_type == TokenType.PARAMETER:
+                # This is a @ symbol - check if next is VAR and then EQ
+                if self._next and self._next.token_type == TokenType.VAR:
+                    # Look ahead one more to check for EQ
+                    lookahead = self._tokens[self._index + 2] if self._index + 2 < len(self._tokens) else None
+                    if lookahead and lookahead.token_type == TokenType.EQ:
+                        return self._parse_usql_assignment()
+            
+            # Check for EXTRACT and OUTPUT commands  
+            if self._curr and self._curr.text and self._curr.text.upper() == "EXTRACT":
+                return self._parse_usql_extract()
+            
+            if self._curr and self._curr.text and self._curr.text.upper() == "OUTPUT":
+                return self._parse_usql_output()
+                
+            return super()._parse_statement()
+
+        def _parse_usql_assignment(self) -> exp.Expression:
+            """Parse: @variable = SELECT/EXTRACT/expression;"""
+            var = self._parse_id_var()
+            if not var:
+                self.raise_error("Expected variable name")
+            
+            if not self._match(TokenType.EQ):
+                self.raise_error("Expected = after variable name")
+            
+            # Check if this is an EXTRACT statement
+            if self._curr and self._curr.text and self._curr.text.upper() == "EXTRACT":
+                extract_expr = self._parse_usql_extract_expression()
+                return USqlAssignment(this=var, expression=extract_expr)
+            else:
+                # Regular expression (like SELECT)
+                expression = self._parse_select()
+                return USqlAssignment(this=var, expression=expression)
+
+        def _parse_usql_declare_const(self) -> exp.Expression:
+            """Parse: DECLARE CONST @variable type = value;"""
+            var = self._parse_id_var()
+            if not var:
+                self.raise_error("Expected variable name after DECLARE CONST")
+            
+            kind = self._parse_types()
+            if not kind:
+                self.raise_error("Expected type after variable name")
+            
+            default = None
+            if self._match(TokenType.EQ):
+                default = self._parse_bitwise()
+            
+            return USqlDeclareConst(this=var, kind=kind, default=default)
+
+        def _parse_usql_assignment(self) -> exp.Expression:
+            """Parse: @variable = SELECT/EXTRACT/expression;"""
+            var = self._parse_id_var()
+            if not var:
+                self.raise_error("Expected variable name")
+            
+            if not self._match(TokenType.EQ):
+                self.raise_error("Expected = after variable name")
+            
+            # Check if this is an EXTRACT statement
+            if self._match_text_seq("EXTRACT"):
+                self._retreat(self._index - 1)
+                extract_expr = self._parse_usql_extract_expression()
+                return USqlAssignment(this=var, expression=extract_expr)
+            else:
+                # Regular expression (like SELECT)
+                expression = self._parse_select()
+                return USqlAssignment(this=var, expression=expression)
+
+        def _parse_usql_extract(self) -> exp.Expression:
+            """Parse standalone: @var = EXTRACT ... FROM ... USING ..."""
+            var = None
+            if self._curr and self._curr.token_type == TokenType.VAR:
+                var = self._parse_id_var()
+                if not self._match(TokenType.EQ):
+                    self.raise_error("Expected = after variable name")
+            
+            extract_expr = self._parse_usql_extract_expression()
+            
+            if var:
+                return USqlAssignment(this=var, expression=extract_expr)
+            else:
+                return extract_expr
+
+        def _parse_usql_extract_expression(self) -> exp.Expression:
+            """Parse: EXTRACT columns FROM source USING extractor"""
+            if not self._match_text_seq("EXTRACT"):
+                self.raise_error("Expected EXTRACT")
+            
+            # Parse column definitions (Id int, Name string, etc.)
+            expressions = []
+            while not self._match(TokenType.FROM):
+                if expressions:
+                    if not self._match(TokenType.COMMA):
+                        break
+                
+                col_name = self._parse_id_var() or self._parse_identifier()
+                if not col_name:
+                    self.raise_error("Expected column name")
+                
+                col_type = self._parse_types()
+                if not col_type:
+                    self.raise_error("Expected column type")
+                
+                expressions.append(exp.ColumnDef(this=col_name, kind=col_type))
+            
+            if not expressions:
+                self.raise_error("Expected column definitions")
+            
+            # FROM clause
+            from_expr = self._parse_table_parts()
+            if not from_expr:
+                self.raise_error("Expected FROM source")
+            
+            # USING clause
+            if not self._match(TokenType.USING):
+                self.raise_error("Expected USING clause")
+            
+            # Parse the extractor - could be simple identifier or complex expression
+            # For now, let's just capture everything until semicolon as a simple expression
+            using_tokens = []
+            while self._curr and self._curr.token_type != TokenType.SEMICOLON:
+                using_tokens.append(self._curr.text)
+                self._advance()
+            
+            if not using_tokens:
+                self.raise_error("Expected extractor function")
+            
+            # Create a simple anonymous function with the captured text
+            using_expr = exp.Anonymous(this="".join(using_tokens), expressions=[])
+            
+            return USqlExtract(
+                expressions=expressions,
+                **{"from": from_expr},
+                using=using_expr
+            )
+
+        def _parse_usql_output(self) -> exp.Expression:
+            """Parse: OUTPUT @variable TO destination USING outputter"""
+            if not self._curr or self._curr.text.upper() != "OUTPUT":
+                self.raise_error("Expected OUTPUT")
+            
+            self._advance()  # consume OUTPUT
+            
+            # Source (@variable or SELECT query)
+            this = self._parse_id_var() or self._parse_select()
+            if not this:
+                self.raise_error("Expected variable or SELECT after OUTPUT")
+            
+            # TO clause
+            if not self._curr or self._curr.text.upper() != "TO":
+                self.raise_error("Expected TO clause")
+            
+            self._advance()  # consume TO
+            
+            to_expr = self._parse_id_var() or self._parse_string()
+            if not to_expr:
+                self.raise_error("Expected destination after TO")
+            
+            # USING clause
+            if not self._match(TokenType.USING):
+                self.raise_error("Expected USING clause")
+            
+            # Parse the outputter - similar to extractor parsing
+            using_tokens = []
+            while self._curr and self._curr.token_type != TokenType.SEMICOLON:
+                using_tokens.append(self._curr.text)
+                self._advance()
+            
+            if not using_tokens:
+                self.raise_error("Expected outputter function")
+            
+            using_expr = exp.Anonymous(this="".join(using_tokens), expressions=[])
+            
+            return USqlOutput(
+                this=this,
+                to=to_expr,
+                using=using_expr
+            )
+
         def _parse_create(self) -> exp.Create | exp.Command:
             create = super()._parse_create()
 
@@ -128,7 +429,43 @@ class USQL(TSQL):
         TRANSFORMS = {
             **TSQL.Generator.TRANSFORMS,
             exp.Create: transforms.preprocess([_add_default_precision_to_varchar]),
+            USqlExtract: lambda self, e: self._usql_extract_sql(e),
+            USqlOutput: lambda self, e: self._usql_output_sql(e),
+            USqlAssignment: lambda self, e: self._usql_assignment_sql(e),
+            USqlDeclareConst: lambda self, e: self._usql_declare_const_sql(e),
         }
+
+        def _usql_extract_sql(self, expression: USqlExtract) -> str:
+            """Generate: EXTRACT columns FROM source USING extractor"""
+            columns = ", ".join([
+                f"{self.sql(col.this)} {self.sql(col.kind)}" 
+                for col in expression.expressions
+            ])
+            from_sql = self.sql(expression.args.get("from"))
+            using_sql = self.sql(expression.using)
+            return f"EXTRACT {columns} FROM {from_sql} USING {using_sql}"
+
+        def _usql_output_sql(self, expression: USqlOutput) -> str:
+            """Generate: OUTPUT source TO destination USING outputter"""
+            this_sql = self.sql(expression.this)
+            to_sql = self.sql(expression.to)
+            using_sql = self.sql(expression.using)
+            return f"OUTPUT {this_sql} TO {to_sql} USING {using_sql}"
+
+        def _usql_assignment_sql(self, expression: USqlAssignment) -> str:
+            """Generate: @variable = expression"""
+            var_sql = self.sql(expression.this)
+            expr_sql = self.sql(expression.expression)
+            return f"{var_sql} = {expr_sql}"
+
+        def _usql_declare_const_sql(self, expression: USqlDeclareConst) -> str:
+            """Generate: DECLARE CONST @variable type = value"""
+            var_sql = self.sql(expression.this)
+            type_sql = self.sql(expression.kind)
+            parts = [f"DECLARE CONST {var_sql} {type_sql}"]
+            if expression.default:
+                parts.append(f" = {self.sql(expression.default)}")
+            return "".join(parts)
 
         def datatype_sql(self, expression: exp.DataType) -> str:
             # Check if this is a temporal type that needs precision handling. Fabric limits temporal
