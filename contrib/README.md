@@ -53,3 +53,14 @@ Full GCI:
 ```bash
 make check
 ```
+
+## Build and upload to ADO
+
+```bash
+pip install build twine
+python -m build
+```
+
+The `whl` will be available here: `~/sqlglot/dist/sqlglot-0.1.dev5757-py3-none-any.whl`.
+
+It can be installed with `pip install --force-reinstall path/to/your/package.whl`
