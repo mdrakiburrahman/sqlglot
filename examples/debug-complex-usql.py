@@ -72,6 +72,7 @@ for idx, (filename, didsucceed, exception, sparksqls) in enumerate(results, 1):
         print("-"*80)
         for i, stmt in enumerate(sparksqls, 1):
             print(f"{stmt}")
+            print("- "*40)
         print("-"*80)
     else:
         print("❌ Failed")
