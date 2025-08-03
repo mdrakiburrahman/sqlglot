@@ -107,7 +107,7 @@ fabric_sql = sqlglot.transpile(spark_sql, read="spark", write="fabric")[0]
 
 print("=== ORIGINAL SPARK SQL ===")
 print(spark_sql)
-print("\n" + "="*80 + "\n")
+print("\n" + "=" * 80 + "\n")
 print("=== FORMATTED FABRIC SQL ===")
 formatted_fabric = sqlglot.transpile(spark_sql, read="spark", write="fabric", pretty=True)[0]
 print(formatted_fabric)

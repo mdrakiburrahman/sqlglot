@@ -48,10 +48,13 @@ make install-dev
 
 ## Tests
 
-Full GCI:
+Tests:
 
 ```bash
-make check
+make style  # Only linter checks
+make unit   # Only unit tests (or unit-rs, to use the Rust tokenizer)
+make test   # Unit and integration tests (or test-rs, to use the Rust tokenizer)
+make check  # Full test suite & linter checks
 ```
 
 ## Build and upload to ADO
