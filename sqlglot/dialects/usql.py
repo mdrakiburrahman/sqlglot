@@ -138,6 +138,68 @@ def _cap_data_type_precision(expression: exp.DataType, max_precision: int = 6) -
     )
 
 
+def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Expression:
+    """Convert USqlCreateView to standard Create expression for transpilation"""
+    if isinstance(expression, USqlCreateView):
+        # Extract the view body and convert to a standard SELECT
+        body = expression.args.get("expression")
+        if body and len(body) > 0:
+            # Try to find the SELECT statement in the body
+            select_stmt = None
+            for stmt in body:
+                if isinstance(stmt, exp.Select):
+                    select_stmt = stmt
+                    break
+                elif isinstance(stmt, USqlAssignment) and isinstance(stmt.expression, exp.Select):
+                    select_stmt = stmt.expression
+                    break
+            
+            if not select_stmt:
+                # If no SELECT found, create a simple placeholder SELECT
+                select_stmt = exp.Select(expressions=[exp.Literal.string("'VIEW_PLACEHOLDER'")])
+            
+            # Create a standard CREATE VIEW expression
+            return exp.Create(
+                this=expression.this,  # view name
+                kind="VIEW",
+                expression=select_stmt,
+                replace=False,
+                temporary=False
+            )
+    
+    elif isinstance(expression, USqlAssignment):
+        # Convert USqlAssignment to just its expression (typically a SELECT)
+        return expression.expression
+    
+    elif isinstance(expression, USqlExtract):
+        # Convert EXTRACT to SELECT from file
+        columns = [exp.alias_(col.this, col.this) for col in expression.expressions]
+        from_clause = expression.args.get("from")
+        
+        # Create a SELECT statement that reads from the file
+        return exp.Select(
+            expressions=columns,
+            **{"from": exp.From(this=from_clause)}
+        )
+    
+    elif isinstance(expression, USqlOutput):
+        # Convert OUTPUT to INSERT or CREATE TABLE AS SELECT
+        source = expression.this
+        destination = expression.args.get("to")
+        
+        # For now, convert to INSERT statement  
+        return exp.Insert(
+            this=destination,
+            expression=source if isinstance(source, exp.Select) else exp.Select(expressions=[source])
+        )
+    
+    elif isinstance(expression, (USqlDeclareConst, USqlHashDeclare, USqlIfDirective)):
+        # Convert these to placeholder expressions for compatibility
+        return exp.Placeholder(this="USQL_DIRECTIVE_PLACEHOLDER")
+    
+    return expression
+
+
 def _add_default_precision_to_varchar(expression: exp.Expression) -> exp.Expression:
     """Transform function to add VARCHAR(MAX) or CHAR(MAX) for cross-dialect conversion."""
     if (
@@ -238,6 +300,30 @@ class USQL(TSQL):
             return super()._scan_var()
 
     class Parser(TSQL.Parser):
+        # Add post-processing to convert USql expressions to standard SQL for transpilation
+        def parse(
+            self,
+            sql: str | exp.Expression,
+            *args,
+            **kwargs,
+        ) -> t.List[t.Optional[exp.Expression]]:
+            expressions = super().parse(sql, *args, **kwargs)
+            
+            # Apply transformations for cross-dialect compatibility
+            transformed_expressions = []
+            for expression in expressions:
+                if expression:
+                    transformed = self._transform_usql_to_standard(expression)
+                    transformed_expressions.append(transformed)
+                else:
+                    transformed_expressions.append(expression)
+            
+            return transformed_expressions
+        
+        def _transform_usql_to_standard(self, expression: exp.Expression) -> exp.Expression:
+            """Transform U-SQL specific expressions to standard SQL for transpilation"""
+            return expression.transform(_convert_usql_create_view_to_standard)
+
         # U-SQL specific parsing functions
         def _parse_statement(self) -> t.Optional[exp.Expression]:
             # Check for U-SQL specific statements first

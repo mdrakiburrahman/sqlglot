@@ -37,8 +37,10 @@ print("=== TESTING OUTPUT STATEMENT ===")
 try:
     result = sqlglot.parse(usql, read="usql")
     print("SUCCESS:", result)
-    sparksql = sqlglot.transpile(usql, read="usql", write="spark")[0]
-    print("Spark SQL:", sparksql)
+    sparksql = sqlglot.transpile(usql, read="usql", write="spark", pretty=True)
+    print("=== SPARK SQL ===")
+    for i, stmt in enumerate(sparksql, 1):
+        print(stmt)
 except Exception as e:
     print("=== ERROR ===")
     print(e)
