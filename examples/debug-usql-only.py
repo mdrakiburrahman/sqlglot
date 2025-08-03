@@ -21,6 +21,9 @@ PARAMS
 )
 AS
 BEGIN
+
+    #DECLARE potato string = @"Crispy";
+    #DECLARE tomato string = @"Crunchy";
     
     searchlog = EXTRACT IId:int, UId:int, TimeStamp:DateTime, Market:string, Query:string, DwellTime:int, Results:string, ClickedUrls:string
         FROM @"my/ScopeTutorial/SampleInputs/SearchLog.txt"

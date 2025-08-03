@@ -6,6 +6,7 @@ from sqlglot import exp, parser, transforms
 from sqlglot.dialects.dialect import NormalizationStrategy
 from sqlglot.dialects.tsql import TSQL
 from sqlglot.tokens import TokenType
+
 def _convert_usql_to_standard_sql(expression: exp.Expression) -> exp.Expression:
     """Transform U-SQL specific constructs to standard SQL equivalents"""
     if isinstance(expression, USqlDeclareConst):
@@ -169,7 +170,11 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
     
     elif isinstance(expression, USqlAssignment):
         # Convert USqlAssignment to just its expression (typically a SELECT)
-        return expression.expression
+        # But first ensure the nested expression is also transformed
+        nested_expr = expression.expression
+        if isinstance(nested_expr, (USqlExtract, USqlOutput, USqlCreateView)):
+            nested_expr = _convert_usql_create_view_to_standard(nested_expr)
+        return nested_expr
     
     elif isinstance(expression, USqlExtract):
         # Convert EXTRACT to SELECT from file
@@ -283,6 +288,7 @@ class USQL(TSQL):
         def _scan_var(self) -> bool:
             # Handle #DECLARE and other # directives
             if self._match("#"):
+                start_index = self._index
                 self._advance()
                 if self._match_text_seq("DECLARE"):
                     self._add_token(TokenType.PRAGMA, "#DECLARE")
@@ -294,8 +300,8 @@ class USQL(TSQL):
                     self._add_token(TokenType.PRAGMA, "#ENDIF")
                     return True
                 else:
-                    # Just a # symbol, back up
-                    self._retreat(self._index - 1)
+                    # Just a # symbol, reset position and let parent handle it
+                    self._index = start_index
             
             return super()._scan_var()
 
@@ -342,7 +348,14 @@ class USQL(TSQL):
                 if has_schema:
                     return self._parse_usql_create_view()
             
-            # Handle #DECLARE directive
+            # Handle #DECLARE directive (HASH + DECLARE tokens)
+            if (self._curr and self._curr.token_type == TokenType.HASH and
+                self._next and self._next.token_type == TokenType.DECLARE):
+                self._advance()  # consume HASH
+                self._advance()  # consume DECLARE
+                return self._parse_usql_hash_declare()
+            
+            # Handle #DECLARE directive (single PRAGMA token - fallback)
             if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#DECLARE":
                 self._advance()  # consume #DECLARE
                 return self._parse_usql_hash_declare()
