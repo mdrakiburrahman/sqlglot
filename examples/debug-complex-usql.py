@@ -65,4 +65,6 @@ for filename, didsucceed, exception in results:
         print(f"{filename}: Success")
     else:
         print(f"{filename}: Failed")
-        print(f"  Exception: {exception}")
+        print("-"*80)
+        print(f"\t: {exception}")
+        print("-"*80)
