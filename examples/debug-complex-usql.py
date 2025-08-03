@@ -1,6 +1,7 @@
 import os
 import sqlglot
 from sqlglot.dialects.usql import _convert_usql_to_standard_sql
+import traceback
 
 BASE_DIR = os.path.dirname(__file__)
 SAMPLES_DIRS = [
@@ -53,7 +54,7 @@ for SAMPLES_DIR in SAMPLES_DIRS:
 
             except Exception as e:
                 didsucceed = False
-                exception = e
+                exception = traceback.format_exc()
 
             results.append((f"{os.path.basename(SAMPLES_DIR)}/{filename}", didsucceed, exception))
 
