@@ -31,3 +31,25 @@
    GIT_ROOT=$(git rev-parse --show-toplevel)
    chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && source ~/.bashrc
    ```
+
+## Install
+
+Initialize Virtual Env:
+
+```bash
+python3 -m venv .venv
+source ./.venv/bin/activate
+```
+
+```bash
+make install
+make install-dev
+```
+
+## Tests
+
+Full GCI:
+
+```bash
+make check
+```

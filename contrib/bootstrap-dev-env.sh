@@ -18,7 +18,7 @@ echo ""
 
 missing_pkgs=()
 
-if ! command -v python3 &> /dev/null; then
+if ! command -v python &> /dev/null; then
     missing_pkgs+=(python3 python3-pip python3-dev python3-venv build-essential)
 fi
 
@@ -33,6 +33,12 @@ if [ ${#missing_pkgs[@]} -ne 0 ]; then
     sudo apt install -y "${missing_pkgs[@]}"
 fi
 
+if ! command -v rustc &> /dev/null; then
+    echo "Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env"
+fi
+
 echo ""
 echo "┌───────────────────────────────┐"
 echo "│ Installing VS Code extensions │"
@@ -42,6 +48,8 @@ echo ""
 code --install-extension github.copilot
 code --install-extension ms-python.python
 code --install-extension ms-python.vscode-pylance
+code --install-extension rust-lang.rust-analyzer
+code --install-extension vadimcn.vscode-lldb
 
 echo ""
 echo "┌──────────┐"
@@ -50,3 +58,5 @@ echo "└──────────┘"
 echo ""
 
 echo "Python: $(python3 --version)"
+echo "Rust: $(rustc --version)"
+echo "Cargo: $(cargo --version)"
