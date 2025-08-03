@@ -97,6 +97,7 @@ class Dialects(str, Enum):
     TERADATA = "teradata"
     TRINO = "trino"
     TSQL = "tsql"
+    USQL = "usql"
     EXASOL = "exasol"
 
 

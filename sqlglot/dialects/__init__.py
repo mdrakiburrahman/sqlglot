@@ -95,6 +95,7 @@ DIALECTS = [
     "Teradata",
     "Trino",
     "TSQL",
+    "USQL",
     "Exasol",
 ]
 

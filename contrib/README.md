@@ -57,6 +57,12 @@ make test   # Unit and integration tests (or test-rs, to use the Rust tokenizer)
 make check  # Full test suite & linter checks
 ```
 
+Run the e2e test script:
+
+```bash
+python ${GIT_ROOT}/examples/explore-usql.py
+```
+
 ## Build and upload to ADO
 
 ```bash
