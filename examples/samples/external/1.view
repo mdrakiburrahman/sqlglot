@@ -1,0 +1,29 @@
+CREATE VIEW SearchLog
+SCHEMA
+(
+    IId : int,
+    UId : int,
+    TimeStamp : DateTime,
+    Market : string,
+    Query : string,
+    DwellTime : int,
+    Results : string,
+    ClickedUrls : string
+)
+PARAMS
+(
+    start string,
+    end string
+)
+AS
+BEGIN
+    
+    searchlog = EXTRACT IId:int, UId:int, TimeStamp:DateTime, Market:string, Query:string, DwellTime:int, Results:string, ClickedUrls:string
+        FROM @"my/ScopeTutorial/SampleInputs/SearchLog.txt"
+        USING DefaultTextExtractor();
+    
+    filtered_searchlog =
+        SELECT *
+        FROM searchlog
+        WHERE TimeStamp >= DateTime.Parse(@start) AND TimeStamp <= DateTime.Parse(@end);
+END;
