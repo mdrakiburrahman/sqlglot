@@ -60,11 +60,13 @@ for SAMPLES_DIR in SAMPLES_DIRS:
 print("\n" + "="*80 + "\n")
 print("=== CONVERSION RESULTS ===")
 print("\n" + "="*80 + "\n")
-for filename, didsucceed, exception in results:
+total = len(results)
+for idx, (filename, didsucceed, exception) in enumerate(results, 1):
+    print(f"[{idx} of {total}] {filename}:", end=" ")
     if didsucceed:
-        print(f"{filename}: Success")
+        print("Success")
     else:
-        print(f"{filename}: Failed")
+        print("Failed")
         print("-"*80)
         print(f"\t: {exception}")
         print("-"*80)
