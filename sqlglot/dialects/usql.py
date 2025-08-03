@@ -158,14 +158,55 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
                 # If no SELECT found, create a simple placeholder SELECT
                 select_stmt = exp.Select(expressions=[exp.Literal.string("'VIEW_PLACEHOLDER'")])
             
-            # Create a standard CREATE VIEW expression
-            return exp.Create(
-                this=expression.this,  # view name
-                kind="VIEW",
-                expression=select_stmt,
-                replace=False,
-                temporary=False
-            )
+            # Get the view name (table identifier)
+            view_name = expression.this
+            
+            # Convert U-SQL schema to standard schema if present
+            usql_schema = expression.args.get("schema")
+            if usql_schema and usql_schema.expressions:
+                # Convert U-SQL column definitions to standard column definitions
+                schema_columns = []
+                for col_def in usql_schema.expressions:
+                    col_name = col_def.this
+                    col_type = col_def.kind
+                    
+                    # Convert U-SQL types to standard SQL types
+                    if col_type:
+                        # Handle U-SQL specific types
+                        if col_type.this == exp.DataType.Type.VARCHAR and not col_type.expressions:
+                            # U-SQL "string" -> VARCHAR without length becomes VARCHAR in Spark
+                            col_type = exp.DataType(this=exp.DataType.Type.VARCHAR)
+                        elif col_type.this == exp.DataType.Type.DATETIME:
+                            # U-SQL DateTime -> TIMESTAMP in Spark
+                            col_type = exp.DataType(this=exp.DataType.Type.TIMESTAMP)
+                    
+                    schema_columns.append(exp.ColumnDef(this=col_name, kind=col_type))
+                
+                # Create a schema with the view name and column definitions
+                view_schema = exp.Schema(
+                    this=view_name,  # The view name
+                    expressions=schema_columns  # The column definitions
+                )
+                
+                # Create a standard CREATE VIEW expression with schema
+                create_expr = exp.Create(
+                    this=view_schema,  # Schema includes both view name and columns
+                    kind="VIEW",
+                    expression=select_stmt,
+                    replace=False,
+                    temporary=False
+                )
+            else:
+                # No schema, just create view with name
+                create_expr = exp.Create(
+                    this=view_name,
+                    kind="VIEW", 
+                    expression=select_stmt,
+                    replace=False,
+                    temporary=False
+                )
+            
+            return create_expr
     
     elif isinstance(expression, USqlAssignment):
         # Convert USqlAssignment to just its expression (typically a SELECT)

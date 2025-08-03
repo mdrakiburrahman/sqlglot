@@ -38,6 +38,8 @@ try:
     result = sqlglot.parse(usql, read="usql")
     print("SUCCESS:", result)
     sparksql = sqlglot.transpile(usql, read="usql", write="spark", pretty=True)
+    print("=== USQL ===")
+    print(usql)
     print("=== SPARK SQL ===")
     for i, stmt in enumerate(sparksql, 1):
         print(stmt)
