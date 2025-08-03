@@ -26,8 +26,8 @@ for SAMPLES_DIR in SAMPLES_DIRS:
                 print("\n" + "="*80 + "\n")
                 print(f"=== ORIGINAL U-SQL: {filename} ({os.path.basename(SAMPLES_DIR)}) ===")
                 print("\n" + "="*80 + "\n")
-                if len(usql) > 10000:
-                    print(usql[:10000] + "\n....")
+                if len(usql) > 1000:
+                    print(usql[:1000] + "\n....")
                 else:
                     print(usql)
 

@@ -61,7 +61,7 @@ Run the e2e test script:
 
 ```bash
 python ${GIT_ROOT}/examples/debug-usql-only.py
-python ${GIT_ROOT}/examples/debug-complex-usql.py
+python ${GIT_ROOT}/examples/convert-usql-samples.py
 ```
 
 ## Build and upload to ADO
