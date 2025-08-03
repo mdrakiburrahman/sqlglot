@@ -66,16 +66,16 @@ print("=== CONVERSION RESULTS ===")
 print("\n" + "="*80 + "\n")
 total = len(results)
 for idx, (filename, didsucceed, exception, sparksqls) in enumerate(results, 1):
-    print(f"[{idx} of {total}] {filename}:", end=" ")
+    ident = f"[{idx} of {total}]"
     if didsucceed:
-        print("✅ Success")
+        print(f"{ident} ✅ Success: {filename} -> {len(sparksqls)} Spark SQL statements:")
         print("-"*80)
         for i, stmt in enumerate(sparksqls, 1):
             print(f"{stmt}")
             print("- "*40)
         print("-"*80)
     else:
-        print("❌ Failed")
+        print(f"{ident} ❌ Failed: {filename}")
         print("-"*80)
         print(f"{exception}")
         print("-"*80)
