@@ -1,0 +1,37 @@
+// declare constants
+DECLARE CONST @inputFile string = "input.csv";
+DECLARE CONST @outputFile string = "output.tsv";
+
+
+// read from CSV
+@input = 
+EXTRACT
+    Id int,
+    Name string,
+    Dept string,
+    Salary double
+FROM @inputFile
+USING Extractors.Csv();
+
+/* test block comment
+@row = 
+SELECT
+    Id,
+    Name,
+    Salary
+FROM @input
+WHERE Dept == "Computer Science"; */
+
+// filter required rows
+@row = 
+SELECT
+    Id,
+    Name,
+    Salary
+FROM (SELECT * FROM @input)   // wow a nested query
+WHERE Dept == "Computer Science";
+
+// output to a TSV file
+OUTPUT @row
+TO @outputFile
+USING Outputters.Tsv(outputHeader: true);
