@@ -42,10 +42,12 @@ for SAMPLES_DIR in SAMPLES_DIRS:
                 print(f"=== CONVERTED SPARK-SQL: {filename} ({os.path.basename(SAMPLES_DIR)}) ===")
                 print("\n" + "="*80 + "\n")
 
+                sparksqls = []
                 for expr in transformed:
                     try:
                         spark_sql = sqlglot.transpile(str(expr), read="usql", write="spark", pretty=True)[0]
                         print(spark_sql)
+                        sparksqls.append(spark_sql)
                     except Exception as e:
                         didsucceed = False
                         exception = e
@@ -55,19 +57,24 @@ for SAMPLES_DIR in SAMPLES_DIRS:
             except Exception as e:
                 didsucceed = False
                 exception = traceback.format_exc()
+                sparksqls = []
 
-            results.append((f"{os.path.basename(SAMPLES_DIR)}/{filename}", didsucceed, exception))
+            results.append((f"{os.path.basename(SAMPLES_DIR)}/{filename}", didsucceed, exception, sparksqls))
 
 print("\n" + "="*80 + "\n")
 print("=== CONVERSION RESULTS ===")
 print("\n" + "="*80 + "\n")
 total = len(results)
-for idx, (filename, didsucceed, exception) in enumerate(results, 1):
+for idx, (filename, didsucceed, exception, sparksqls) in enumerate(results, 1):
     print(f"[{idx} of {total}] {filename}:", end=" ")
     if didsucceed:
-        print("Success")
-    else:
-        print("Failed")
+        print("✅ Success")
         print("-"*80)
-        print(f"\t: {exception}")
+        for i, stmt in enumerate(sparksqls, 1):
+            print(f"{stmt}")
+        print("-"*80)
+    else:
+        print("❌ Failed")
+        print("-"*80)
+        print(f"{exception}")
         print("-"*80)
