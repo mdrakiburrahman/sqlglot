@@ -91,6 +91,33 @@ class USqlDeclareConst(exp.Expression):
     }
 
 
+class USqlCreateView(exp.Expression):
+    """U-SQL CREATE VIEW with SCHEMA and PARAMS: CREATE VIEW name SCHEMA (...) PARAMS (...) AS BEGIN ... END"""
+    arg_types = {
+        "this": True,  # view name
+        "schema": False,  # schema definition (column list)
+        "params": False,  # parameters definition
+        "expression": True,  # view body (AS BEGIN ... END)
+    }
+
+
+class USqlHashDeclare(exp.Expression):
+    """U-SQL hash declare: #DECLARE variable type = value;"""
+    arg_types = {
+        "this": True,  # variable name
+        "kind": True,  # data type
+        "default": False,  # default value
+    }
+
+
+class USqlIfDirective(exp.Expression):
+    """U-SQL conditional compilation: #IF(condition) ... #ENDIF"""
+    arg_types = {
+        "this": True,  # condition
+        "expression": False,  # body
+    }
+
+
 def _cap_data_type_precision(expression: exp.DataType, max_precision: int = 6) -> exp.DataType:
     """
     Cap the precision of to a maximum of `max_precision` digits.
@@ -160,9 +187,15 @@ class USQL(TSQL):
         # Also add UTINYINT keyword mapping since T-SQL doesn't have it
         KEYWORDS = {
             **TSQL.Tokenizer.KEYWORDS,
+            "BOOL": TokenType.BOOLEAN,
             "CONST": TokenType.CONSTRAINT,  # Reuse existing token 
+            "DATETIME": TokenType.DATETIME,
             "EXTRACT": TokenType.VAR,  # Treat as identifier, not command
+            "GUID": TokenType.UUID,  # Use UUID token for GUID
             "OUTPUT": TokenType.VAR,   # Treat as identifier, not command  
+            "PARAMS": TokenType.PARAMETER,  # Reuse for PARAMS keyword
+            "SCHEMA": TokenType.SCHEMA,
+            "STRING": TokenType.VARCHAR,  # U-SQL string type
             "TIMESTAMP": TokenType.TIMESTAMP,
             "USING": TokenType.USING,
             "UTINYINT": TokenType.UTINYINT,
@@ -185,10 +218,55 @@ class USQL(TSQL):
                 return True
             return super()._scan_operator()
 
+        def _scan_var(self) -> bool:
+            # Handle #DECLARE and other # directives
+            if self._match("#"):
+                self._advance()
+                if self._match_text_seq("DECLARE"):
+                    self._add_token(TokenType.PRAGMA, "#DECLARE")
+                    return True
+                elif self._match_text_seq("IF"):
+                    self._add_token(TokenType.PRAGMA, "#IF")
+                    return True
+                elif self._match_text_seq("ENDIF"):
+                    self._add_token(TokenType.PRAGMA, "#ENDIF")
+                    return True
+                else:
+                    # Just a # symbol, back up
+                    self._retreat(self._index - 1)
+            
+            return super()._scan_var()
+
     class Parser(TSQL.Parser):
         # U-SQL specific parsing functions
         def _parse_statement(self) -> t.Optional[exp.Expression]:
             # Check for U-SQL specific statements first
+            
+            # Handle CREATE VIEW with SCHEMA (U-SQL specific) - look ahead to find SCHEMA keyword
+            if (self._curr and self._curr.token_type == TokenType.CREATE and
+                self._next and self._next.token_type == TokenType.VIEW):
+                # Look ahead to see if SCHEMA appears within next few tokens
+                has_schema = False
+                for i in range(2, min(6, len(self._tokens) - self._index)):
+                    if (self._index + i < len(self._tokens) and 
+                        self._tokens[self._index + i].token_type == TokenType.SCHEMA):
+                        has_schema = True
+                        break
+                
+                if has_schema:
+                    return self._parse_usql_create_view()
+            
+            # Handle #DECLARE directive
+            if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#DECLARE":
+                self._advance()  # consume #DECLARE
+                return self._parse_usql_hash_declare()
+            
+            # Handle #IF directive
+            if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#IF":
+                self._advance()  # consume #IF
+                return self._parse_usql_if_directive()
+            
+            # Check for regular DECLARE CONST
             if self._match(TokenType.DECLARE):
                 if self._match(TokenType.CONSTRAINT):  # CONST reuses CONSTRAINT token
                     return self._parse_usql_declare_const()
@@ -214,6 +292,263 @@ class USQL(TSQL):
                 return self._parse_usql_output()
                 
             return super()._parse_statement()
+
+        def _parse_usql_create_view(self) -> exp.Expression:
+            """Parse U-SQL CREATE VIEW with SCHEMA"""
+            if not self._match(TokenType.CREATE):
+                self.raise_error("Expected CREATE")
+            
+            if not self._match(TokenType.VIEW):
+                self.raise_error("Expected VIEW")
+            
+            view_name = self._parse_table_parts()
+            if not view_name:
+                self.raise_error("Expected view name")
+            
+            # Check for SCHEMA clause
+            schema_def = None
+            if self._match(TokenType.SCHEMA):
+                schema_def = self._parse_usql_schema_definition()
+            
+            # Check for PARAMS clause
+            params_def = None
+            if self._curr and self._curr.token_type == TokenType.PARAMETER and self._curr.text == "PARAMS":
+                self._advance()  # consume PARAMS
+                params_def = self._parse_usql_params_definition()
+            
+            # Parse AS BEGIN ... END body
+            if not self._match(TokenType.ALIAS):
+                self.raise_error("Expected AS after view definition")
+            
+            if not self._match(TokenType.BEGIN):
+                self.raise_error("Expected BEGIN after AS")
+            
+            # Parse the body until END
+            body_expressions = []
+            
+            # Collect all tokens until END (with bounds checking)
+            while (self._curr and 
+                   self._index < len(self._tokens) and 
+                   self._curr.token_type != TokenType.END):
+                self._advance()
+            
+            # At this point, self._curr should be the END token
+            if not self._curr or self._curr.token_type != TokenType.END:
+                self.raise_error("Expected END")
+            
+            # Consume the END token
+            self._advance()
+            
+            # Create the U-SQL view expression
+            return USqlCreateView(
+                this=view_name,
+                schema=schema_def,
+                params=params_def,
+                expression=body_expressions
+            )
+
+        def _parse_create(self) -> exp.Create | exp.Command:
+            """Override to handle U-SQL CREATE VIEW with SCHEMA"""
+            start_index = self._index
+            
+            if not self._match(TokenType.CREATE):
+                return None
+            
+            # Check if this is a U-SQL VIEW with SCHEMA
+            if self._match(TokenType.VIEW):
+                view_name = self._parse_table_parts()
+                if not view_name:
+                    self.raise_error("Expected view name")
+                
+                # Check for SCHEMA clause
+                schema_def = None
+                if self._match(TokenType.SCHEMA):
+                    schema_def = self._parse_usql_schema_definition()
+                
+                # Check for PARAMS clause
+                params_def = None
+                if self._curr and self._curr.text and self._curr.text.upper() == "PARAMS":
+                    self._advance()  # consume PARAMS
+                    params_def = self._parse_usql_params_definition()
+                
+                # Parse AS BEGIN ... END body
+                if not self._match(TokenType.ALIAS):
+                    self.raise_error("Expected AS after view definition")
+                
+                if not self._match(TokenType.BEGIN):
+                    self.raise_error("Expected BEGIN after AS")
+                
+                # Parse the body until END
+                body_expressions = []
+                while (self._curr and self._curr.token_type != TokenType.END):
+                    stmt = self._parse_statement()
+                    if stmt:
+                        body_expressions.append(stmt)
+                
+                # Consume END
+                if not self._match(TokenType.END):
+                    self.raise_error("Expected END")
+                
+                # Create the U-SQL view expression
+                return USqlCreateView(
+                    this=view_name,
+                    schema=schema_def,
+                    params=params_def,
+                    expression=body_expressions
+                )
+            else:
+                # Not a U-SQL view, reset and let parent handle it
+                self._index = start_index
+                return super()._parse_create()
+
+        def _parse_usql_schema_definition(self) -> exp.Schema:
+            """Parse SCHEMA (column_name: type, ...) definition"""
+            if not self._match(TokenType.L_PAREN):
+                self.raise_error("Expected ( after SCHEMA")
+            
+            columns = []
+            while True:
+                if self._match(TokenType.R_PAREN):
+                    break
+                
+                # Parse column_name: type
+                col_name = self._parse_id_var()
+                if not col_name:
+                    self.raise_error("Expected column name")
+                
+                if not self._match(TokenType.COLON):
+                    self.raise_error("Expected : after column name")
+                
+                col_type = self._parse_usql_type()
+                if not col_type:
+                    self.raise_error("Expected column type")
+                
+                columns.append(exp.ColumnDef(this=col_name, kind=col_type))
+                
+                if not self._match(TokenType.COMMA):
+                    # No comma, expect closing paren next
+                    if not self._match(TokenType.R_PAREN):
+                        self.raise_error("Expected , or ) in column list")
+                    break
+            
+            return exp.Schema(expressions=columns)
+
+        def _parse_usql_params_definition(self) -> exp.Schema:
+            """Parse PARAMS (param_name type [DEFAULT value], ...) definition"""
+            if not self._match(TokenType.L_PAREN):
+                self.raise_error("Expected ( after PARAMS")
+            
+            params = []
+            while True:
+                if self._match(TokenType.R_PAREN):
+                    break
+                
+                # Parse param_name type [DEFAULT value]
+                param_name = self._parse_id_var()
+                if not param_name:
+                    self.raise_error("Expected parameter name")
+                
+                param_type = self._parse_usql_type()
+                if not param_type:
+                    self.raise_error("Expected parameter type")
+                
+                default_value = None
+                if self._curr and self._curr.text and self._curr.text.upper() == "DEFAULT":
+                    self._advance()  # consume DEFAULT
+                    if not self._match(TokenType.EQ):
+                        self.raise_error("Expected = after DEFAULT")
+                    default_value = self._parse_bitwise()
+                
+                params.append(exp.ColumnDef(this=param_name, kind=param_type, default=default_value))
+                
+                if not self._match(TokenType.COMMA):
+                    # No comma, expect closing paren next
+                    if not self._match(TokenType.R_PAREN):
+                        self.raise_error("Expected , or ) in parameter list")
+                    break
+            
+            return exp.Schema(expressions=params)
+
+        def _parse_usql_type(self) -> exp.DataType:
+            """Parse U-SQL types including nullable types (type?)"""
+            # Parse base type
+            if self._curr and self._curr.text and self._curr.text.upper() == "STRING":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.VARCHAR)
+            elif self._curr and self._curr.text and self._curr.text.upper() == "BOOL":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.BOOLEAN)
+            elif self._curr and self._curr.text and self._curr.text.upper() == "DATETIME":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.DATETIME)
+            elif self._curr and self._curr.text and self._curr.text.upper() == "GUID":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.UUID)
+            elif self._curr and self._curr.text and self._curr.text.upper() == "DOUBLE":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.DOUBLE)
+            elif self._curr and self._curr.text and self._curr.text.upper() == "LONG":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.BIGINT)
+            elif self._curr and self._curr.text and self._curr.text.upper() == "INT":
+                self._advance()
+                base_type = exp.DataType(this=exp.DataType.Type.INT)
+            else:
+                # Try standard type parsing
+                base_type = self._parse_types()
+            
+            if not base_type:
+                return None
+            
+            # Check for nullable suffix ?
+            if self._match(TokenType.PLACEHOLDER):  # ? token
+                # Mark as nullable (this is dialect specific)
+                base_type.set("nullable", True)
+            
+            return base_type
+
+        def _parse_usql_hash_declare(self) -> exp.Expression:
+            """Parse: #DECLARE variable type = value;"""
+            var = self._parse_id_var()
+            if not var:
+                self.raise_error("Expected variable name after #DECLARE")
+            
+            kind = self._parse_usql_type()
+            if not kind:
+                self.raise_error("Expected type after variable name")
+            
+            default = None
+            if self._match(TokenType.EQ):
+                default = self._parse_bitwise()
+            
+            return USqlHashDeclare(this=var, kind=kind, default=default)
+
+        def _parse_usql_if_directive(self) -> exp.Expression:
+            """Parse: #IF(condition) statements #ENDIF"""
+            if not self._match(TokenType.L_PAREN):
+                self.raise_error("Expected ( after #IF")
+            
+            condition = self._parse_bitwise()
+            if not condition:
+                self.raise_error("Expected condition in #IF")
+            
+            if not self._match(TokenType.R_PAREN):
+                self.raise_error("Expected ) after #IF condition")
+            
+            # Parse body until #ENDIF
+            body_expressions = []
+            while (self._curr and 
+                   not (self._curr.token_type == TokenType.PRAGMA and 
+                        self._curr.text == "#ENDIF")):
+                stmt = self._parse_statement()
+                if stmt:
+                    body_expressions.append(stmt)
+            
+            # Consume #ENDIF
+            if self._curr and self._curr.token_type == TokenType.PRAGMA:
+                self._advance()
+            
+            return USqlIfDirective(this=condition, expression=body_expressions)
 
         def _parse_usql_assignment(self) -> exp.Expression:
             """Parse: @variable = SELECT/EXTRACT/expression;"""
@@ -433,6 +768,9 @@ class USQL(TSQL):
             USqlOutput: lambda self, e: self._usql_output_sql(e),
             USqlAssignment: lambda self, e: self._usql_assignment_sql(e),
             USqlDeclareConst: lambda self, e: self._usql_declare_const_sql(e),
+            USqlCreateView: lambda self, e: self._usql_create_view_sql(e),
+            USqlHashDeclare: lambda self, e: self._usql_hash_declare_sql(e),
+            USqlIfDirective: lambda self, e: self._usql_if_directive_sql(e),
         }
 
         def _usql_extract_sql(self, expression: USqlExtract) -> str:
@@ -465,6 +803,61 @@ class USQL(TSQL):
             parts = [f"DECLARE CONST {var_sql} {type_sql}"]
             if expression.default:
                 parts.append(f" = {self.sql(expression.default)}")
+            return "".join(parts)
+
+        def _usql_create_view_sql(self, expression: USqlCreateView) -> str:
+            """Generate: CREATE VIEW name SCHEMA (...) PARAMS (...) AS BEGIN ... END"""
+            view_name = self.sql(expression.this)
+            parts = [f"CREATE VIEW {view_name}"]
+            
+            if expression.schema:
+                schema_cols = []
+                for col in expression.schema.expressions:
+                    col_name = self.sql(col.this)
+                    col_type = self.sql(col.kind)
+                    nullable = "?" if col.kind and col.kind.args.get("nullable") else ""
+                    schema_cols.append(f"{col_name}: {col_type}{nullable}")
+                parts.append(f" SCHEMA ({', '.join(schema_cols)})")
+            
+            if expression.params:
+                param_cols = []
+                for param in expression.params.expressions:
+                    param_name = self.sql(param.this)
+                    param_type = self.sql(param.kind)
+                    param_str = f"{param_name} {param_type}"
+                    if param.default:
+                        param_str += f" DEFAULT = {self.sql(param.default)}"
+                    param_cols.append(param_str)
+                parts.append(f" PARAMS ({', '.join(param_cols)})")
+            
+            parts.append(" AS BEGIN")
+            
+            if expression.expression:
+                for stmt in expression.expression:
+                    parts.append(f"\n{self.sql(stmt)}")
+            
+            parts.append("\nEND")
+            return "".join(parts)
+
+        def _usql_hash_declare_sql(self, expression: USqlHashDeclare) -> str:
+            """Generate: #DECLARE variable type = value"""
+            var_sql = self.sql(expression.this)
+            type_sql = self.sql(expression.kind)
+            parts = [f"#DECLARE {var_sql} {type_sql}"]
+            if expression.default:
+                parts.append(f" = {self.sql(expression.default)}")
+            return "".join(parts)
+
+        def _usql_if_directive_sql(self, expression: USqlIfDirective) -> str:
+            """Generate: #IF(condition) statements #ENDIF"""
+            condition_sql = self.sql(expression.this)
+            parts = [f"#IF({condition_sql})"]
+            
+            if expression.expression:
+                for stmt in expression.expression:
+                    parts.append(f"\n{self.sql(stmt)}")
+            
+            parts.append("\n#ENDIF")
             return "".join(parts)
 
         def datatype_sql(self, expression: exp.DataType) -> str:

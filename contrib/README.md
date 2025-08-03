@@ -60,8 +60,6 @@ make check  # Full test suite & linter checks
 Run the e2e test script:
 
 ```bash
-python ${GIT_ROOT}/examples/debug-tokens.py
-python ${GIT_ROOT}/examples/debug-simple-usql.py
 python ${GIT_ROOT}/examples/debug-complex-usql.py
 ```
 

@@ -14,12 +14,21 @@ for SAMPLES_DIR in SAMPLES_DIRS:
     if not os.path.isdir(SAMPLES_DIR):
         continue
     for filename in os.listdir(SAMPLES_DIR):
-        if filename.endswith(".script"):
+        if any(filename.endswith(ext) for ext in [".script", ".view"]):
             filepath = os.path.join(SAMPLES_DIR, filename)
             didsucceed = True
+            exception = None
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     usql = f.read()
+
+                print("\n" + "="*80 + "\n")
+                print(f"=== ORIGINAL U-SQL: {filename} ({os.path.basename(SAMPLES_DIR)}) ===")
+                print("\n" + "="*80 + "\n")
+                if len(usql) > 10000:
+                    print(usql[:10000] + "\n....")
+                else:
+                    print(usql)
 
                 parsed = sqlglot.parse(usql, read="usql")
                 transformed = []
@@ -29,29 +38,31 @@ for SAMPLES_DIR in SAMPLES_DIRS:
                         transformed.append(new_expr)
 
                 print("\n" + "="*80 + "\n")
-                print(f"=== ORIGINAL U-SQL: {filename} ({os.path.basename(SAMPLES_DIR)}) ===")
-                print("\n" + "="*80 + "\n")
-                print(usql)
-                print("\n" + "="*80 + "\n")
-                print("=== CONVERTED SPARK-SQL ===")
+                print(f"=== CONVERTED SPARK-SQL: {filename} ({os.path.basename(SAMPLES_DIR)}) ===")
                 print("\n" + "="*80 + "\n")
 
                 for expr in transformed:
                     try:
                         spark_sql = sqlglot.transpile(str(expr), read="usql", write="spark", pretty=True)[0]
                         print(spark_sql)
-                    except Exception:
+                    except Exception as e:
                         didsucceed = False
+                        exception = e
                         print("[Failed to transpile]")
                         break
 
-            except Exception:
+            except Exception as e:
                 didsucceed = False
+                exception = e
 
-            results.append((f"{os.path.basename(SAMPLES_DIR)}/{filename}", didsucceed))
+            results.append((f"{os.path.basename(SAMPLES_DIR)}/{filename}", didsucceed, exception))
 
 print("\n" + "="*80 + "\n")
 print("=== CONVERSION RESULTS ===")
 print("\n" + "="*80 + "\n")
-for filename, didsucceed in results:
-    print(f"{filename}: {'Success' if didsucceed else 'Failed'}")
+for filename, didsucceed, exception in results:
+    if didsucceed:
+        print(f"{filename}: Success")
+    else:
+        print(f"{filename}: Failed")
+        print(f"  Exception: {exception}")
