@@ -145,19 +145,39 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
         # Extract the view body and convert to a standard SELECT
         body = expression.args.get("expression")
         if body and len(body) > 0:
-            # Try to find the SELECT statement in the body
+            # Look for the LAST meaningful SELECT statement in the body
+            # U-SQL views typically end with a final SELECT that represents the view output
             select_stmt = None
-            for stmt in body:
+            
+            # Iterate through body in reverse to find the last meaningful statement
+            for stmt in reversed(body):
                 if isinstance(stmt, exp.Select):
                     select_stmt = stmt
                     break
-                elif isinstance(stmt, USqlAssignment) and isinstance(stmt.expression, exp.Select):
-                    select_stmt = stmt.expression
-                    break
+                elif isinstance(stmt, USqlAssignment):
+                    # For assignments, check what the expression is
+                    if isinstance(stmt.expression, exp.Select):
+                        # This is a variable assignment with a SELECT - use this
+                        select_stmt = stmt.expression
+                        break
+                    elif isinstance(stmt.expression, USqlExtract):
+                        # This is an EXTRACT assignment - convert to SELECT but keep looking
+                        # for a later SELECT (EXTRACT is usually intermediate, not final)
+                        extract = stmt.expression
+                        if hasattr(extract, 'expressions') and extract.expressions:
+                            columns = [exp.alias_(col.this, col.this) for col in extract.expressions]
+                            from_clause = extract.args.get("from")
+                            fallback_select = exp.Select(
+                                expressions=columns,
+                                **{"from": exp.From(this=from_clause)}
+                            )
+                            # Only use this if we don't find a better SELECT later
+                            if not select_stmt:
+                                select_stmt = fallback_select
             
+            # Only use placeholder as absolute last resort
             if not select_stmt:
-                # If no SELECT found, create a simple placeholder SELECT
-                select_stmt = exp.Select(expressions=[exp.Literal.string("'VIEW_PLACEHOLDER'")])
+                select_stmt = exp.Select(expressions=[exp.Star()])
             
             # Create a standard CREATE VIEW expression
             return exp.Create(
@@ -198,9 +218,15 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
             expression=source if isinstance(source, exp.Select) else exp.Select(expressions=[source])
         )
     
-    elif isinstance(expression, (USqlDeclareConst, USqlHashDeclare, USqlIfDirective)):
-        # Convert these to placeholder expressions for compatibility
-        return exp.Placeholder(this="USQL_DIRECTIVE_PLACEHOLDER")
+    elif isinstance(expression, (USqlDeclareConst, USqlHashDeclare)):
+        # U-SQL constant and hash declarations are preprocessing directives
+        # Return as-is, they will be filtered out at the parser level
+        return expression
+    
+    elif isinstance(expression, USqlIfDirective):
+        # U-SQL #IF directives are conditional compilation
+        # Return as-is, they will be filtered out at the parser level
+        return expression
     
     return expression
 
@@ -320,7 +346,9 @@ class USQL(TSQL):
             for expression in expressions:
                 if expression:
                     transformed = self._transform_usql_to_standard(expression)
-                    transformed_expressions.append(transformed)
+                    # Filter out U-SQL directives that don't have SQL equivalents
+                    if transformed and not isinstance(transformed, (USqlDeclareConst, USqlHashDeclare, USqlIfDirective)):
+                        transformed_expressions.append(transformed)
                 else:
                     transformed_expressions.append(expression)
             
