@@ -193,7 +193,7 @@ class USQL(TSQL):
             "EXTRACT": TokenType.VAR,  # Treat as identifier, not command
             "GUID": TokenType.UUID,  # Use UUID token for GUID
             "OUTPUT": TokenType.VAR,   # Treat as identifier, not command  
-            "PARAMS": TokenType.PARAMETER,  # Reuse for PARAMS keyword
+            "PARAMS": TokenType.VAR,  # Treat as identifier, not command
             "SCHEMA": TokenType.SCHEMA,
             "STRING": TokenType.VARCHAR,  # U-SQL string type
             "TIMESTAMP": TokenType.TIMESTAMP,
@@ -275,7 +275,7 @@ class USQL(TSQL):
                     self._retreat(self._index - 1)
                     return super()._parse_statement()
             
-            # Check for variable assignment (@var = ...)
+            # Check for variable assignment (@var = ... or var = ...)
             if self._curr and self._curr.token_type == TokenType.PARAMETER:
                 # This is a @ symbol - check if next is VAR and then EQ
                 if self._next and self._next.token_type == TokenType.VAR:
@@ -283,6 +283,11 @@ class USQL(TSQL):
                     lookahead = self._tokens[self._index + 2] if self._index + 2 < len(self._tokens) else None
                     if lookahead and lookahead.token_type == TokenType.EQ:
                         return self._parse_usql_assignment()
+            
+            # Check for regular variable assignment (var = ...)
+            if (self._curr and self._curr.token_type == TokenType.VAR and
+                self._next and self._next.token_type == TokenType.EQ):
+                return self._parse_usql_variable_assignment()
             
             # Check for EXTRACT and OUTPUT commands  
             if self._curr and self._curr.text and self._curr.text.upper() == "EXTRACT":
@@ -312,7 +317,7 @@ class USQL(TSQL):
             
             # Check for PARAMS clause
             params_def = None
-            if self._curr and self._curr.token_type == TokenType.PARAMETER and self._curr.text == "PARAMS":
+            if self._curr and self._curr.token_type == TokenType.VAR and self._curr.text.upper() == "PARAMS":
                 self._advance()  # consume PARAMS
                 params_def = self._parse_usql_params_definition()
             
@@ -323,21 +328,40 @@ class USQL(TSQL):
             if not self._match(TokenType.BEGIN):
                 self.raise_error("Expected BEGIN after AS")
             
-            # Parse the body until END
+            # Parse the body until END - try to parse as SQL statements
             body_expressions = []
             
-            # Collect all tokens until END (with bounds checking)
+            # Try to parse statements inside the body
             while (self._curr and 
                    self._index < len(self._tokens) and 
                    self._curr.token_type != TokenType.END):
-                self._advance()
+                
+                try:
+                    # Try to parse a regular statement
+                    stmt = self._parse_select(nested=True)
+                    if stmt:
+                        body_expressions.append(stmt)
+                    else:
+                        # If can't parse as select, advance and try again
+                        if self._index < len(self._tokens):
+                            self._advance()
+                        else:
+                            break
+                except:
+                    # If parsing fails, advance and continue
+                    if self._index < len(self._tokens):
+                        self._advance()
+                    else:
+                        break
             
-            # At this point, self._curr should be the END token
-            if not self._curr or self._curr.token_type != TokenType.END:
-                self.raise_error("Expected END")
+            # Handle the END token
+            if self._curr and self._curr.token_type == TokenType.END:
+                if self._index < len(self._tokens):
+                    self._advance()  # consume END
             
-            # Consume the END token
-            self._advance()
+            # If no valid expressions found, use placeholder
+            if not body_expressions:
+                body_expressions = [exp.Placeholder(this="BODY_PLACEHOLDER")]
             
             # Create the U-SQL view expression
             return USqlCreateView(
@@ -411,19 +435,26 @@ class USQL(TSQL):
                 if self._match(TokenType.R_PAREN):
                     break
                 
-                # Parse column_name: type
+                # Parse column_name: type [DEFAULT value]
                 col_name = self._parse_id_var()
                 if not col_name:
                     self.raise_error("Expected column name")
                 
-                if not self._match(TokenType.COLON):
-                    self.raise_error("Expected : after column name")
+                # Accept optional colon after column name (U-SQL allows both with and without colon)
+                if self._curr and self._curr.token_type == TokenType.COLON:
+                    self._advance()
                 
                 col_type = self._parse_usql_type()
                 if not col_type:
                     self.raise_error("Expected column type")
                 
-                columns.append(exp.ColumnDef(this=col_name, kind=col_type))
+                # Check for optional DEFAULT value
+                default_value = None
+                if self._curr and self._curr.text and self._curr.text.upper() == "DEFAULT":
+                    self._advance()  # consume DEFAULT
+                    default_value = self._parse_bitwise()
+                
+                columns.append(exp.ColumnDef(this=col_name, kind=col_type, default=default_value))
                 
                 if not self._match(TokenType.COMMA):
                     # No comma, expect closing paren next
@@ -443,11 +474,26 @@ class USQL(TSQL):
                 if self._match(TokenType.R_PAREN):
                     break
                 
-                # Parse param_name type [DEFAULT value]
-                param_name = self._parse_id_var()
+                # Parse param_name [: ] type [DEFAULT value]
+                # Two syntaxes supported:
+                # 1. @param: type (with colon)
+                # 2. param type (without colon)
+                
+                # Special handling for parameter names that might be keywords like "end"
+                if self._curr and self._curr.token_type == TokenType.END:
+                    # "end" is a parameter name, not END keyword in this context
+                    param_name = exp.Identifier(this=self._curr.text)
+                    self._advance()
+                else:
+                    param_name = self._parse_id_var()
+                
                 if not param_name:
                     self.raise_error("Expected parameter name")
                 
+                # Check if there's a colon (syntax 1) or not (syntax 2)
+                if self._curr and self._curr.token_type == TokenType.COLON:
+                    self._advance()  # consume colon
+                    
                 param_type = self._parse_usql_type()
                 if not param_type:
                     self.raise_error("Expected parameter type")
@@ -455,8 +501,7 @@ class USQL(TSQL):
                 default_value = None
                 if self._curr and self._curr.text and self._curr.text.upper() == "DEFAULT":
                     self._advance()  # consume DEFAULT
-                    if not self._match(TokenType.EQ):
-                        self.raise_error("Expected = after DEFAULT")
+                    # In PARAMS, DEFAULT can be followed directly by value (no = required)
                     default_value = self._parse_bitwise()
                 
                 params.append(exp.ColumnDef(this=param_name, kind=param_type, default=default_value))
@@ -584,6 +629,30 @@ class USQL(TSQL):
             
             return USqlDeclareConst(this=var, kind=kind, default=default)
 
+        def _parse_usql_variable_assignment(self) -> exp.Expression:
+            """Parse: variable = SELECT/EXTRACT/expression; (without @ prefix)"""
+            var = self._parse_id_var()
+            if not var:
+                self.raise_error("Expected variable name")
+            
+            if not self._match(TokenType.EQ):
+                self.raise_error("Expected = after variable name")
+            
+            # Check if this is an EXTRACT statement
+            if self._curr and self._curr.text and self._curr.text.upper() == "EXTRACT":
+                extract_expr = self._parse_usql_extract_expression()
+                return USqlAssignment(this=var, expression=extract_expr)
+            else:
+                # Simple literal or expression parsing
+                if self._curr.token_type == TokenType.NUMBER:
+                    value = exp.Literal.number(self._curr.text)
+                    self._advance()
+                    return USqlAssignment(this=var, expression=value)
+                else:
+                    # Try regular expression (like SELECT)
+                    expression = self._parse_select() or self._parse_bitwise()
+                    return USqlAssignment(this=var, expression=expression)
+
         def _parse_usql_assignment(self) -> exp.Expression:
             """Parse: @variable = SELECT/EXTRACT/expression;"""
             var = self._parse_id_var()
@@ -623,7 +692,7 @@ class USQL(TSQL):
             if not self._match_text_seq("EXTRACT"):
                 self.raise_error("Expected EXTRACT")
             
-            # Parse column definitions (Id int, Name string, etc.)
+            # Parse column definitions (Id:int, Name:string, etc.)
             expressions = []
             while not self._match(TokenType.FROM):
                 if expressions:
@@ -634,7 +703,11 @@ class USQL(TSQL):
                 if not col_name:
                     self.raise_error("Expected column name")
                 
-                col_type = self._parse_types()
+                # Accept optional colon after column name (U-SQL allows both with and without colon)
+                if self._curr and self._curr.token_type == TokenType.COLON:
+                    self._advance()
+                
+                col_type = self._parse_usql_type()
                 if not col_type:
                     self.raise_error("Expected column type")
                 
@@ -786,8 +859,8 @@ class USQL(TSQL):
         def _usql_output_sql(self, expression: USqlOutput) -> str:
             """Generate: OUTPUT source TO destination USING outputter"""
             this_sql = self.sql(expression.this)
-            to_sql = self.sql(expression.to)
-            using_sql = self.sql(expression.using)
+            to_sql = self.sql(expression.args.get("to"))
+            using_sql = self.sql(expression.args.get("using"))
             return f"OUTPUT {this_sql} TO {to_sql} USING {using_sql}"
 
         def _usql_assignment_sql(self, expression: USqlAssignment) -> str:
@@ -810,30 +883,39 @@ class USQL(TSQL):
             view_name = self.sql(expression.this)
             parts = [f"CREATE VIEW {view_name}"]
             
-            if expression.schema:
+            schema = expression.args.get("schema")
+            if schema:
                 schema_cols = []
-                for col in expression.schema.expressions:
+                for col in schema.expressions:
                     col_name = self.sql(col.this)
                     col_type = self.sql(col.kind)
                     nullable = "?" if col.kind and col.kind.args.get("nullable") else ""
-                    schema_cols.append(f"{col_name}: {col_type}{nullable}")
+                    col_str = f"{col_name}: {col_type}{nullable}"
+                    # Add DEFAULT value if present
+                    default_val = col.args.get("default")
+                    if default_val:
+                        col_str += f" DEFAULT {self.sql(default_val)}"
+                    schema_cols.append(col_str)
                 parts.append(f" SCHEMA ({', '.join(schema_cols)})")
             
-            if expression.params:
+            params = expression.args.get("params")
+            if params:
                 param_cols = []
-                for param in expression.params.expressions:
+                for param in params.expressions:
                     param_name = self.sql(param.this)
                     param_type = self.sql(param.kind)
                     param_str = f"{param_name} {param_type}"
-                    if param.default:
-                        param_str += f" DEFAULT = {self.sql(param.default)}"
+                    default_val = param.args.get("default")
+                    if default_val:
+                        param_str += f" DEFAULT = {self.sql(default_val)}"
                     param_cols.append(param_str)
                 parts.append(f" PARAMS ({', '.join(param_cols)})")
             
             parts.append(" AS BEGIN")
             
-            if expression.expression:
-                for stmt in expression.expression:
+            body = expression.args.get("expression")
+            if body:
+                for stmt in body:
                     parts.append(f"\n{self.sql(stmt)}")
             
             parts.append("\nEND")
