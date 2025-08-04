@@ -40,6 +40,9 @@ BEGIN
         endDate = DateTime.Parse(@end).AddDays(@endDateOffset).ToString("yyyy-MM-dd"),
         tomato = @tomato
     );
+    #IF(!LOCAL)
+        #DECLARE tomatoViewFullPath string = string.Format("{0}local/Tomato/Sandbox/Views/Public/{1}.view", @tomato, @start);
+    #ENDIF
     
     filtered_searchlog =
         SELECT *

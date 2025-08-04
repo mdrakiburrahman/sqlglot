@@ -318,6 +318,36 @@ class USQL(TSQL):
 
     # Fabric is case-sensitive unlike T-SQL which is case-insensitive
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
+    
+    def parse(
+        self,
+        sql: str | t.List[str] | exp.Expression,
+        **opts,
+    ) -> t.List[t.Optional[exp.Expression]]:
+        """Override parse to preprocess U-SQL directives before tokenization"""
+        if isinstance(sql, str):
+            sql = self._preprocess_usql_directives(sql)
+        
+        return super().parse(sql, **opts)
+    
+    def _preprocess_usql_directives(self, sql: str) -> str:
+        """Preprocess U-SQL to handle multi-statement directives like #IF...#ENDIF"""
+        # For now, we'll replace semicolons inside #IF...#ENDIF blocks with a placeholder
+        # so that sqlglot doesn't split them into separate statements
+        
+        import re
+        
+        # Find #IF...#ENDIF blocks and replace semicolons inside them
+        def replace_semicolons(match):
+            block = match.group(0)
+            # Replace semicolons with a placeholder (we'll restore them in the parser)
+            return block.replace(';', '___USQL_SEMICOLON___')
+        
+        # Pattern to match #IF...#ENDIF blocks - use a simpler approach
+        pattern = r'#IF.*?#ENDIF'
+        processed_sql = re.sub(pattern, replace_semicolons, sql, flags=re.DOTALL | re.IGNORECASE)
+        
+        return processed_sql
 
     class Tokenizer(TSQL.Tokenizer):
         # U-SQL supports // single-line comments in addition to -- and /* */
@@ -328,11 +358,16 @@ class USQL(TSQL):
         # Also add UTINYINT keyword mapping since T-SQL doesn't have it
         KEYWORDS = {
             **TSQL.Tokenizer.KEYWORDS,
+            "#DECLARE": TokenType.PRAGMA,
+            "#ENDIF": TokenType.PRAGMA,
+            "#IF": TokenType.PRAGMA,
+            "___USQL_SEMICOLON___": TokenType.VAR,  # Use VAR instead of SEMICOLON so it doesn't split
             "BOOL": TokenType.BOOLEAN,
             "CONST": TokenType.CONSTRAINT,  # Reuse existing token 
             "DATETIME": TokenType.DATETIME,
             "EXTRACT": TokenType.VAR,  # Treat as identifier, not command
             "GUID": TokenType.UUID,  # Use UUID token for GUID
+            "LOCAL": TokenType.VAR,  # U-SQL preprocessor variable
             "OUTPUT": TokenType.VAR,   # Treat as identifier, not command  
             "PARAMS": TokenType.VAR,  # Treat as identifier, not command
             "SCHEMA": TokenType.SCHEMA,
@@ -359,27 +394,32 @@ class USQL(TSQL):
                 return True
             return super()._scan_operator()
 
-        def _scan_var(self) -> bool:
-            # Handle #DECLARE and other # directives
-            if self._match("#"):
-                start_index = self._index
-                self._advance()
-                if self._match_text_seq("DECLARE"):
-                    self._add_token(TokenType.PRAGMA, "#DECLARE")
-                    return True
-                elif self._match_text_seq("IF"):
-                    self._add_token(TokenType.PRAGMA, "#IF")
-                    return True
-                elif self._match_text_seq("ENDIF"):
-                    self._add_token(TokenType.PRAGMA, "#ENDIF")
-                    return True
-                else:
-                    # Just a # symbol, reset position and let parent handle it
-                    self._index = start_index
-            
-            return super()._scan_var()
 
     class Parser(TSQL.Parser):
+        # Override STATEMENT_PARSERS to handle U-SQL specific PRAGMA tokens
+        STATEMENT_PARSERS = {
+            **TSQL.Parser.STATEMENT_PARSERS,
+            TokenType.PRAGMA: lambda self: self._parse_usql_pragma(),
+        }
+        
+        def _parse_usql_pragma(self) -> exp.Expression:
+            """Parse U-SQL PRAGMA tokens like #IF, #DECLARE, #ENDIF"""
+            # The PRAGMA token has already been consumed and is in _prev
+            if self._prev and self._prev.token_type == TokenType.PRAGMA:
+                if self._prev.text == "#IF":
+                    return self._parse_usql_if_directive_after_token()
+                elif self._prev.text == "#DECLARE":
+                    return self._parse_usql_hash_declare_after_token()
+                elif self._prev.text == "#ENDIF":
+                    # #ENDIF should never be a standalone statement
+                    # It should always be consumed by the matching #IF parser
+                    self.raise_error("Unexpected #ENDIF without matching #IF")
+                else:
+                    # Fall back to default pragma handling
+                    return self.expression(exp.Pragma, this=self._parse_expression())
+            else:
+                self.raise_error("Expected PRAGMA token")
+        
         # Add post-processing to convert USql expressions to standard SQL for transpilation
         def parse(
             self,
@@ -425,22 +465,15 @@ class USQL(TSQL):
                 if has_schema:
                     return self._parse_usql_create_view()
             
-            # Handle #DECLARE directive (HASH + DECLARE tokens)
+            # Handle #DECLARE directive (HASH + DECLARE tokens) - legacy format
             if (self._curr and self._curr.token_type == TokenType.HASH and
                 self._next and self._next.token_type == TokenType.DECLARE):
                 self._advance()  # consume HASH
                 self._advance()  # consume DECLARE
                 return self._parse_usql_hash_declare()
             
-            # Handle #DECLARE directive (single PRAGMA token - fallback)
-            if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#DECLARE":
-                self._advance()  # consume #DECLARE
-                return self._parse_usql_hash_declare()
-            
-            # Handle #IF directive
-            if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#IF":
-                self._advance()  # consume #IF
-                return self._parse_usql_if_directive()
+            # Note: #IF and #DECLARE PRAGMA tokens are handled by STATEMENT_PARSERS
+            # Note: #ENDIF should never be a standalone statement - it's consumed by #IF parser
             
             # Check for regular DECLARE CONST
             if self._match(TokenType.DECLARE):
@@ -737,6 +770,10 @@ class USQL(TSQL):
 
         def _parse_usql_hash_declare(self) -> exp.Expression:
             """Parse: #DECLARE variable type = value;"""
+            # Consume the #DECLARE token if it hasn't been consumed yet
+            if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#DECLARE":
+                self._advance()  # consume #DECLARE
+            
             var = self._parse_id_var()
             if not var:
                 self.raise_error("Expected variable name after #DECLARE")
@@ -751,12 +788,59 @@ class USQL(TSQL):
             
             return USqlHashDeclare(this=var, kind=kind, default=default)
 
+        def _parse_usql_hash_declare_after_token(self) -> exp.Expression:
+            """Parse: #DECLARE variable type = value; - token already consumed"""
+            
+            var = self._parse_id_var()
+            if not var:
+                self.raise_error("Expected variable name after #DECLARE")
+            
+            kind = self._parse_usql_type()
+            if not kind:
+                self.raise_error("Expected type after variable name")
+            
+            default = None
+            if self._match(TokenType.EQ):
+                # Simple manual parsing for the default value expression
+                # that stops at semicolon placeholder and preserves the remaining tokens
+                tokens = []
+                paren_depth = 0
+                
+                while (self._curr and 
+                       not (paren_depth == 0 and self._curr.token_type == TokenType.VAR and self._curr.text == "___USQL_SEMICOLON___") and
+                       not (paren_depth == 0 and self._curr.token_type == TokenType.PRAGMA)):
+                    
+                    if self._curr.token_type == TokenType.L_PAREN:
+                        paren_depth += 1
+                    elif self._curr.token_type == TokenType.R_PAREN:
+                        paren_depth -= 1
+                        
+                    tokens.append(self._curr.text)
+                    self._advance()
+                
+                # Create a simple string representation of the expression
+                if tokens:
+                    default_text = "".join(tokens)
+                    default = exp.Literal.string(default_text)
+                
+                # Consume semicolon placeholder if present
+                if (self._curr and self._curr.token_type == TokenType.VAR and 
+                    self._curr.text == "___USQL_SEMICOLON___"):
+                    self._advance()
+                        
+            return USqlHashDeclare(this=var, kind=kind, default=default)
+
         def _parse_usql_if_directive(self) -> exp.Expression:
             """Parse: #IF(condition) statements #ENDIF"""
+            # Consume the #IF token
+            if not (self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#IF"):
+                self.raise_error("Expected #IF")
+            self._advance()  # consume #IF
+            
             if not self._match(TokenType.L_PAREN):
                 self.raise_error("Expected ( after #IF")
             
-            condition = self._parse_bitwise()
+            condition = self._parse_usql_preprocessor_condition()
             if not condition:
                 self.raise_error("Expected condition in #IF")
             
@@ -777,6 +861,82 @@ class USQL(TSQL):
                 self._advance()
             
             return USqlIfDirective(this=condition, expression=body_expressions)
+
+        def _parse_usql_if_directive_after_token(self) -> exp.Expression:
+            """Parse: #IF(condition) statements #ENDIF - token already consumed"""
+            
+            if not self._match(TokenType.L_PAREN):
+                self.raise_error("Expected ( after #IF")
+            
+            condition = self._parse_usql_preprocessor_condition()
+            if not condition:
+                self.raise_error("Expected condition in #IF")
+            
+            if not self._match(TokenType.R_PAREN):
+                self.raise_error("Expected ) after #IF condition")
+            
+            # Parse body until #ENDIF
+            body_expressions = []
+            
+            while (self._curr and 
+                   not (self._curr.token_type == TokenType.PRAGMA and 
+                        self._curr.text == "#ENDIF")):
+                
+                # Handle nested U-SQL directives explicitly within the #IF block
+                if self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#DECLARE":
+                    self._advance()  # consume the #DECLARE token
+                    stmt = self._parse_usql_hash_declare_after_token()
+                    body_expressions.append(stmt)
+                elif self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#IF":
+                    # Nested #IF directive
+                    self._advance()  # consume the #IF token
+                    stmt = self._parse_usql_if_directive_after_token()
+                    body_expressions.append(stmt)
+                else:
+                    # For any other statements, call the main statement parser
+                    # This will handle regular SQL statements and other U-SQL constructs
+                    stmt = self._parse_statement()
+                    if stmt:
+                        body_expressions.append(stmt)
+                    else:
+                        # If we can't parse a statement, something is wrong - advance to avoid infinite loop
+                        if self._curr:
+                            self._advance()
+                        else:
+                            break
+            
+            # Consume #ENDIF
+            if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#ENDIF":
+                self._advance()
+            else:
+                self.raise_error(f"Expected #ENDIF but found: {self._curr}")
+            
+            return USqlIfDirective(this=condition, expression=body_expressions)
+
+        def _parse_usql_preprocessor_condition(self) -> exp.Expression:
+            """Parse U-SQL preprocessor conditions that may include LOCAL and other special variables"""
+            # Handle NOT operator
+            if self._match(TokenType.NOT):
+                condition = self._parse_usql_preprocessor_condition()
+                return exp.Not(this=condition) if condition else None
+                
+            # Handle parentheses
+            if self._match(TokenType.L_PAREN):
+                condition = self._parse_usql_preprocessor_condition()
+                if not self._match(TokenType.R_PAREN):
+                    self.raise_error("Expected closing parenthesis")
+                return condition
+            
+            # Handle special U-SQL preprocessor variables
+            if self._curr and self._curr.token_type == TokenType.VAR:
+                if self._curr.text == "LOCAL":
+                    # LOCAL is a special U-SQL preprocessor variable
+                    var_name = self._curr.text
+                    self._advance()
+                    return exp.Identifier(this=var_name)
+            
+            # Fall back to standard expression parsing for other cases
+            return self._parse_bitwise()
 
         def _parse_usql_assignment(self) -> exp.Expression:
             """Parse: @variable = SELECT/EXTRACT/expression;"""
