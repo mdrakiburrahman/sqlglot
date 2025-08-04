@@ -127,6 +127,19 @@ class USqlViewInvocation(exp.Expression):
     }
 
 
+def _remove_usql_if_directives(expression: exp.Expression) -> exp.Expression:
+    """
+    Preprocessing transform to remove U-SQL #IF directives.
+    Since we don't need to process conditional compilation directives,
+    we simply remove them entirely from the AST.
+    """
+    if isinstance(expression, USqlIfDirective):
+        # Return a placeholder to effectively remove the directive
+        return exp.Placeholder()
+    
+    return expression
+
+
 def _cap_data_type_precision(expression: exp.DataType, max_precision: int = 6) -> exp.DataType:
     """
     Cap the precision of to a maximum of `max_precision` digits.
@@ -263,11 +276,6 @@ def _convert_usql_create_view_to_standard(expression: exp.Expression) -> exp.Exp
         # Return as-is, they will be filtered out at the parser level
         return expression
     
-    elif isinstance(expression, USqlIfDirective):
-        # U-SQL #IF directives are conditional compilation
-        # Return as-is, they will be filtered out at the parser level
-        return expression
-    
     return expression
 
 
@@ -387,7 +395,8 @@ class USQL(TSQL):
                 if expression:
                     transformed = self._transform_usql_to_standard(expression)
                     # Filter out U-SQL directives that don't have SQL equivalents
-                    if transformed and not isinstance(transformed, (USqlDeclareConst, USqlHashDeclare, USqlIfDirective)):
+                    # USqlIfDirective will be handled by preprocessing transforms in the generator
+                    if transformed and not isinstance(transformed, (USqlDeclareConst, USqlHashDeclare)):
                         transformed_expressions.append(transformed)
                 else:
                     transformed_expressions.append(expression)
@@ -1083,7 +1092,7 @@ class USQL(TSQL):
             USqlDeclareConst: lambda self, e: self._usql_declare_const_sql(e),
             USqlCreateView: lambda self, e: self._usql_create_view_sql(e),
             USqlHashDeclare: lambda self, e: self._usql_hash_declare_sql(e),
-            USqlIfDirective: lambda self, e: self._usql_if_directive_sql(e),
+            USqlIfDirective: transforms.preprocess([_remove_usql_if_directives]),
             USqlViewInvocation: lambda self, e: self._usql_view_invocation_sql(e),
         }
 
@@ -1169,18 +1178,6 @@ class USQL(TSQL):
             parts = [f"#DECLARE {var_sql} {type_sql}"]
             if expression.default:
                 parts.append(f" = {self.sql(expression.default)}")
-            return "".join(parts)
-
-        def _usql_if_directive_sql(self, expression: USqlIfDirective) -> str:
-            """Generate: #IF(condition) statements #ENDIF"""
-            condition_sql = self.sql(expression.this)
-            parts = [f"#IF({condition_sql})"]
-            
-            if expression.expression:
-                for stmt in expression.expression:
-                    parts.append(f"\n{self.sql(stmt)}")
-            
-            parts.append("\n#ENDIF")
             return "".join(parts)
 
         def _usql_view_invocation_sql(self, expression: USqlViewInvocation) -> str:
