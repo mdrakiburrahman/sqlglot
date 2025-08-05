@@ -332,20 +332,18 @@ class USQL(TSQL):
     
     def _preprocess_usql_directives(self, sql: str) -> str:
         """Preprocess U-SQL to handle multi-statement directives like #IF...#ENDIF"""
-        # For now, we'll replace semicolons inside #IF...#ENDIF blocks with a placeholder
-        # so that sqlglot doesn't split them into separate statements
-        
+
         import re
         
-        # Find #IF...#ENDIF blocks and replace semicolons inside them
-        def replace_semicolons(match):
-            block = match.group(0)
-            # Replace semicolons with a placeholder (we'll restore them in the parser)
-            return block.replace(';', '___USQL_SEMICOLON___')
+        # Remove #IF...#ENDIF blocks for initial parsing
+        def remove_if_blocks(match):
+            # For now, just replace with a comment to preserve line numbers
+            lines = match.group(0).count('\n')
+            return '/* U-SQL #IF block removed */' + '\n' * lines
         
-        # Pattern to match #IF...#ENDIF blocks - use a simpler approach
+        # Pattern to match #IF...#ENDIF blocks
         pattern = r'#IF.*?#ENDIF'
-        processed_sql = re.sub(pattern, replace_semicolons, sql, flags=re.DOTALL | re.IGNORECASE)
+        processed_sql = re.sub(pattern, remove_if_blocks, sql, flags=re.DOTALL | re.IGNORECASE)
         
         return processed_sql
 
@@ -361,7 +359,7 @@ class USQL(TSQL):
             "#DECLARE": TokenType.PRAGMA,
             "#ENDIF": TokenType.PRAGMA,
             "#IF": TokenType.PRAGMA,
-            "___USQL_SEMICOLON___": TokenType.VAR,  # Use VAR instead of SEMICOLON so it doesn't split
+            "___USQL_SEMICOLON___": TokenType.VAR,  # Keep as VAR to preserve text content
             "BOOL": TokenType.BOOLEAN,
             "CONST": TokenType.CONSTRAINT,  # Reuse existing token 
             "DATETIME": TokenType.DATETIME,
@@ -449,6 +447,13 @@ class USQL(TSQL):
 
         # U-SQL specific parsing functions
         def _parse_statement(self) -> t.Optional[exp.Expression]:
+            # Skip semicolon placeholders - they're just formatting artifacts
+            if (self._curr and self._curr.token_type == TokenType.VAR and 
+                hasattr(self._curr, 'text') and self._curr.text == "___USQL_SEMICOLON___"):
+                self._advance()
+                # Try to parse the next statement
+                return self._parse_statement()
+            
             # Check for U-SQL specific statements first
             
             # Handle CREATE VIEW with SCHEMA (U-SQL specific) - look ahead to find SCHEMA keyword
@@ -545,18 +550,24 @@ class USQL(TSQL):
                    self._index < len(self._tokens) and 
                    self._curr.token_type != TokenType.END):
                 
+                # Skip semicolon placeholders - they're just formatting artifacts
+                if (self._curr.token_type == TokenType.VAR and 
+                    hasattr(self._curr, 'text') and self._curr.text == "___USQL_SEMICOLON___"):
+                    self._advance()
+                    continue
+                
                 try:
                     # Try to parse a regular statement
-                    stmt = self._parse_select(nested=True)
+                    stmt = self._parse_statement()
                     if stmt:
                         body_expressions.append(stmt)
                     else:
-                        # If can't parse as select, advance and try again
+                        # If can't parse as statement, advance and try again
                         if self._index < len(self._tokens):
                             self._advance()
                         else:
                             break
-                except:
+                except Exception:
                     # If parsing fails, advance and continue
                     if self._index < len(self._tokens):
                         self._advance()
@@ -614,9 +625,26 @@ class USQL(TSQL):
                 # Parse the body until END
                 body_expressions = []
                 while (self._curr and self._curr.token_type != TokenType.END):
-                    stmt = self._parse_statement()
-                    if stmt:
-                        body_expressions.append(stmt)
+                    # Skip semicolon placeholders - they're just formatting artifacts
+                    if (self._curr.token_type == TokenType.VAR and 
+                        self._curr.text == "___USQL_SEMICOLON___"):
+                        self._advance()
+                        continue
+                    
+                    try:
+                        stmt = self._parse_statement()
+                        if stmt:
+                            body_expressions.append(stmt)
+                        else:
+                            # If statement parsing returns None, advance to avoid infinite loop
+                            if self._curr:
+                                self._advance()
+                    except Exception as e:
+                        # If parsing fails, try to recover by advancing
+                        if self._curr:
+                            self._advance()
+                        else:
+                            break
                 
                 # Consume END
                 if not self._match(TokenType.END):
@@ -801,31 +829,33 @@ class USQL(TSQL):
             
             default = None
             if self._match(TokenType.EQ):
-                # Simple manual parsing for the default value expression
-                # that stops at semicolon placeholder and preserves the remaining tokens
+                # For #DECLARE inside #IF blocks, use simple token collection to avoid over-consumption
                 tokens = []
                 paren_depth = 0
                 
                 while (self._curr and 
-                       not (paren_depth == 0 and self._curr.token_type == TokenType.VAR and self._curr.text == "___USQL_SEMICOLON___") and
-                       not (paren_depth == 0 and self._curr.token_type == TokenType.PRAGMA)):
+                       not (paren_depth == 0 and 
+                            self._curr.token_type == TokenType.VAR and 
+                            hasattr(self._curr, 'text') and self._curr.text == "___USQL_SEMICOLON___") and
+                       not (paren_depth == 0 and 
+                            self._curr.token_type == TokenType.PRAGMA)):
                     
                     if self._curr.token_type == TokenType.L_PAREN:
                         paren_depth += 1
                     elif self._curr.token_type == TokenType.R_PAREN:
                         paren_depth -= 1
-                        
+                    # No need to track quote depth for simple token collection
                     tokens.append(self._curr.text)
                     self._advance()
                 
                 # Create a simple string representation of the expression
                 if tokens:
-                    default_text = "".join(tokens)
+                    default_text = " ".join(tokens)  # Add spaces for readability
                     default = exp.Literal.string(default_text)
                 
                 # Consume semicolon placeholder if present
                 if (self._curr and self._curr.token_type == TokenType.VAR and 
-                    self._curr.text == "___USQL_SEMICOLON___"):
+                    hasattr(self._curr, 'text') and self._curr.text == "___USQL_SEMICOLON___"):
                     self._advance()
                         
             return USqlHashDeclare(this=var, kind=kind, default=default)
@@ -882,6 +912,12 @@ class USQL(TSQL):
                    not (self._curr.token_type == TokenType.PRAGMA and 
                         self._curr.text == "#ENDIF")):
                 
+                # Skip semicolon placeholders - they're just formatting artifacts
+                if (self._curr.token_type == TokenType.VAR and 
+                    hasattr(self._curr, 'text') and self._curr.text == "___USQL_SEMICOLON___"):
+                    self._advance()
+                    continue
+                
                 # Handle nested U-SQL directives explicitly within the #IF block
                 if self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#DECLARE":
                     self._advance()  # consume the #DECLARE token
@@ -909,7 +945,11 @@ class USQL(TSQL):
             if self._curr and self._curr.token_type == TokenType.PRAGMA and self._curr.text == "#ENDIF":
                 self._advance()
             else:
-                self.raise_error(f"Expected #ENDIF but found: {self._curr}")
+                # Debug: show what token we actually found
+                if self._curr:
+                    self.raise_error(f"Expected #ENDIF but found: {self._curr.text} (type: {self._curr.token_type})")
+                else:
+                    self.raise_error("Expected #ENDIF but reached end of input")
             
             return USqlIfDirective(this=condition, expression=body_expressions)
 
